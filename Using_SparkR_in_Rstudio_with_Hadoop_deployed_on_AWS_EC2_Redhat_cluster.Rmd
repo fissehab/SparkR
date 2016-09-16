@@ -1,0 +1,213 @@
+---
+title: "Using SparkR in Rstudio with Hadoop deployed on AWS EC2 Redhat cluster"
+author: "Fisseha Berhane"
+date: "9/13/2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+In a [previous post](http://datascience-enthusiast.com/Hadoop/SparkR_on_HDP_AWS_EC2.html), we saw how to install *R*, *Rstudio server* and *R packages* on AWS EC2 Red Hat cluster to use with Hortonworks Data Platform (HDP 2.4) Hadoop distribution. Now, let's use *SparkR* for data munging. 
+
+
+
+### Starting Up SparkR from RStudio
+
+To connect to a Spark cluster from within Rstudio, we have to set the SPARK_HOME in environment. We can also specify additional libraries that we want to use. I am using [Spark-CSV](https://github.com/databricks/spark-csv), a library for parsing and querying CSV data with Apache Spark, for Spark SQL and DataFrames.
+
+```{r , comment=''}
+Sys.setenv(SPARK_HOME="/usr/hdp/current/spark-client/",
+           'SPARKR_SUBMIT_ARGS'='"--packages" "com.databricks:spark-csv_2.11:1.4.0" "sparkr-shell"')
+
+.libPaths(c(file.path(Sys.getenv("SPARK_HOME"),"R","lib"),.libPaths()))
+
+```
+
+
+
+When loading and attaching a new package in *R*, it is possible to have a name conflict, where a function is masking another function. Since part of *SparkR* is modeled on the *dplyr* package, certain functions in *SparkR* share the same names with those in *dplyr*. Depending on the load order of the two packages, some functions from the package loaded first are masked by those in the package loaded after. In such case, prefix such calls with the package name, for instance, *SparkR::cume_dist(x)* or *dplyr::cume_dist(x)*. Let's load *SparkR* after the other packages so that its functions don't get masked. 
+
+
+### Load Packages
+```{r , comment=''}
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(SparkR)
+```
+
+
+
+### Starting Up SparkContext and SQLContext
+
+The entry point into SparkR is the SparkContext which connects our *R* program to a *Spark cluster*. We can create a SparkContext using sparkR.init. Further, to work with DataFrames we will need a *SQLContext*, which can be created from the *SparkContext*. 
+
+```{r, comment=''}
+sc <- SparkR::sparkR.init()
+sqlContext <-sparkRSQL.init(sc)
+
+```
+
+
+Spark DataFrame operations such as filtering, grouping, aggregating, summary statistics are supported. Operations take advantage of multiple cores/machines and thus can scale to larger data than standalone *R*.
+
+I am using the flights data. I downloaded the data from [here](https://s3-us-west-2.amazonaws.com/sparkr-data/nycflights13.csv) and injested it Hadoop Distributed File System (HDFS). You can read my blog post on data injestion to HDFS [here](http://datascience-enthusiast.com/Hadoop/HDFS_Jupyter.html). 
+
+### Load the flights data
+ 
+ Let's load the flights CSV file using 'read.df'. Note, we are using the spark-csv library.
+```{r, comment=''}
+
+flights <- read.df(sqlContext, "hdfs:///tmp/nycflights13.csv", "com.databricks.spark.csv", header="true")
+
+```
+
+#### Quick Exploration
+Let's see the class, dimensions, and the first few recods of flights.
+We see that the functions below are available in both R and SparkR.
+
+```{r, comment=''}
+class(flights)          # We can see that it of class SparkR
+printSchema(flights)    # Prints out the schema in tree format 
+str(flights)
+head(flights,num=10)    # Return the first NUM rows of a DataFrame as a data.frame. 
+                        # If NUM is NULL, then head() returns the first 6 rows
+dim(flights)            # Returns the dimentions (number of rows and columns) of a DataFrame
+```
+
+
+We can also use *showDF* to print the first numRows rows of a DataFrame. Defaults to 20.
+
+```{r, comment=''}
+showDF(flights,numRows = 25, truncate = FALSE)
+```
+
+
+
+#### Filtering Rows
+The SparkR function *filter* filters the rows of a DataFrame according to a given condition.
+Note: We are using piping (%>%) from the *magrittr* package.
+We can use *collect* or *as.data.frame* to get an R's data.frame from Spark DataFrame.
+```{r, comment=''}
+
+filter(flights, flights$month == 1| flights$day == 1)%>%head(num=7)   # select flights on January 1st and return 7
+  
+filter(flights, flights$month == 1 | flights$month == 2)%>%head()# select flights on January or February
+
+```
+
+
+
+#### Ordering rows
+We can use *arrange* to  sort a DataFrame by the specified column(s).
+```{r, comment=''}
+arrange(flights, flights$year, flights$month, flights$day)%>%showDF(numRows =15,truncate = FALSE)
+
+# Do we want ascending or descending?
+arrange(flights, flights$year, desc(flights$month), asc(flights$day))%>%showDF(numRows =15,truncate = FALSE)
+```
+
+
+
+#### Selecting columns
+*select* selects a set of columns with names or Column expressions.
+```{r, comment=''}
+select(flights, flights$year, flights$month, flights$day)%>%showDF(numRows =15,truncate = FALSE)
+
+# select(flights, c("year", "month", "day")   this also gives the same result
+
+```
+
+
+
+#### Getting distinct records
+*distinct* returns a new DataFrame containing the distinct rows in this DataFrame. 
+
+```{r, comment=''}
+distinct(select(flights, flights$tailnum))%>%dim()  # See how many distinct 'tailnum' we have
+```
+
+
+
+#### Adding new columns
+*withColumn* returns a new DataFrame with the specified column added. 
+```{r, comment=''}
+ withColumn(flights,'gain', flights$arr_delay - flights$dep_delay)%>%
+  select(c('year','month','day','gain'))%>%
+  showDF(numRows =8,truncate = FALSE)
+
+```
+
+
+
+#### Sampling
+*Sample* returns a sampled subset of this DataFrame using a random seed. 
+
+```{r,comment=''}
+
+collect(sample(flights, FALSE, 0.00005))  # Sample without replacement
+
+collect(sample(flights, TRUE, 0.00005))  # Sample with replacement
+```
+
+
+
+#### Counting number of records
+Count the number of records for each group:
+```{r,comment=''}
+count(groupBy(flights, "carrier"))%>%collect()%>% dplyr::mutate(carrier=factor(carrier,levels = carrier[order(count,decreasing =T)]))%>%
+  ggplot(aes(x=carrier, y=count))+geom_bar(stat="identity",fill='sky blue')
+  
+```
+
+
+#### Aggregating
+Group the flights by destination and aggregate
+
+```{r,comment=''}
+agg(group_by(flights, flights$carrier), 
+                    count = n(flights$carrier), maximum =max(flights$distance),
+                    minimum =min(flights$distance),mean =mean(flights$distance),
+                    sample_standard_deviation=stddev_samp(flights$distance)
+    )%>%showDF()
+```
+
+
+
+#### Writing data to file
+
+Save as CSV:
+```{r, comment='', eval=FALSE}
+sampled =sample(flights, FALSE, 0.01)
+write.df(sampled, "I_sampled_it", "com.databricks.spark.csv", mode = "overwrite")
+```
+
+
+Save as parquet
+```{r, comment='', eval=FALSE}
+write.df(sampled, "I_sampled_it", "parquet", "overwrite")
+# We can also save the contents of a DataFrame as a Parquet file, preserving the schema, using write.parquet. Files written out with this method can be read back in as a DataFrame using read.parquet(). 
+```
+
+
+What if we want to Ssave the contents of a DataFrame as a JSON file. 
+```{r, comment='', eval=FALSE}
+write.json(sampled, "I_sampled_it")
+```
+Note: files written out with this method can be read back in as a DataFrame using *read.json()*. 
+
+
+
+
+#### Finally, terminate SparkR
+```{r, eval=FALSE}
+sparkR.stop()
+
+```
+
+
+
